@@ -7,6 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source run/state.env
+# 本脚本当前仅实现 2 节点（hostfile 两行、-np 16 写死）；防止 NODE_COUNT=4 时静默跑出双节点数据
+[ "${NODE_COUNT:-2}" = 2 ] || { echo "当前脚本仅实现 2 节点；${NODE_COUNT} 节点需按 TESTPLAN §4.3 扩展本脚本后再放开此检查" >&2; exit 3; }
 TAG=$1 BIN=$2
 SSH="ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=run/ssh_known_hosts -o ServerAliveInterval=30 -o ConnectTimeout=15 -i $KEY_PATH"
 [ -e "run/logs/$TAG.log" ] && { echo "refuse: run/logs/$TAG.log exists"; exit 3; }

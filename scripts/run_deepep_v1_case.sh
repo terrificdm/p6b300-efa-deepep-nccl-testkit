@@ -13,6 +13,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source run/state.env
+# 本脚本当前仅实现 2 节点（launch/轮询/日志回收均写死双机）；防止 NODE_COUNT=4 时静默跑出双节点数据
+[ "${NODE_COUNT:-2}" = 2 ] || { echo "当前脚本仅实现 2 节点；${NODE_COUNT} 节点需按 TESTPLAN §4.2 扩展本脚本后再放开此检查" >&2; exit 3; }
 TAG=$1 TEST=$2 PORT=$3 EXTRA="${4:-}"
 SSH="ssh -n -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=run/ssh_known_hosts -o ServerAliveInterval=30 -o ConnectTimeout=15 -i $KEY_PATH"
 

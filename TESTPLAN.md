@@ -76,7 +76,7 @@ run/
 |---|---|
 | `REGION` | CB 所在 Region |
 | `CB_ID` | Capacity Block ID；用户只给 Region 时，列出候选让用户选 |
-| `NODE_COUNT` | 2 或 4 |
+| `NODE_COUNT` | 2 或 4。**选 4 时，必须在 Gate A 之前先完成脚本扩展**（三个 case 驱动与 `parse_deepep.py` 当前固定 2 节点，见 §4.2/§4.3 与附录 A；驱动脚本已内置 NODE_COUNT=2 守卫，未扩展直接跑会明确报错）——扩展工作放在花钱开窗口之前做，别占用 CB 计费时间现场改脚本 |
 | `ADMIN_CIDR` | 允许 SSH 的来源网段（如办公室出口 IP/32）。用户坚持 0.0.0.0/0 时要警告并让用户书面确认 |
 | `V1_ENABLED` | 是否加测 DeepEP V1（0/1）。这是一条独立软件栈（见 §4.4），选 1 需额外构建第三个镜像（约 6-12 分钟/节点）并多花约 40 分钟窗口时间；选 0 则本手册所有标注"仅 V1_ENABLED=1"的步骤整体跳过 |
 
@@ -439,7 +439,7 @@ docker run --rm --gpus all --network host --ipc host --privileged   --ulimit mem
 bash scripts/run_deepep_case.sh <tag> <official|pr12> <cache目录后缀> <tokens> <port> ["额外env"]
 ```
 
-脚本前置：`run/state.env` 里有节点 IP 和 KEY_PATH（第 2 部分完成后自然满足）；cache 目录不存在会自动创建。当前实现固定 2 节点（`--nnodes=2`），4 节点需改脚本里的 launch 循环。完整 12 轮照抄即可（交错顺序、端口不重复）：
+脚本前置：`run/state.env` 里有节点 IP 和 KEY_PATH（第 2 部分完成后自然满足）；cache 目录不存在会自动创建。当前实现固定 2 节点（`--nnodes=2`，脚本内置 NODE_COUNT=2 守卫，非 2 直接报错退出）。4 节点扩展范围：三个 case 驱动的 launch/轮询/日志回收循环与 hostfile、`state.env` 的 `WORKER2_*/WORKER3_*` 键（附录 A），**以及 `parse_deepep.py` 的 `parse_tag()`——它当前只读 `<tag>-leader.log` 和 `<tag>-worker.log` 两个文件，4 节点不改会静默只聚合一半 rank（唯一线索是输出里 `ranks` 为 16 而非 32）**。完整 12 轮照抄即可（交错顺序、端口不重复）：
 
 ```bash
 bash scripts/run_deepep_case.sh deepep-prefill-r1     official official_sm12 8192 8311
