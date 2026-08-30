@@ -36,8 +36,8 @@ def main():
         r = parse_tag(logdir, tag)
         if r: results[tag] = r
     print(json.dumps(results, indent=1, ensure_ascii=False))
-    # 轮间一致性
-    print('\n=== 轮间一致性 (dispatch us, r1 vs r2) ===')
+    # 轮间一致性（写 stderr：stdout 保持纯 JSON 可直接重定向消费，与 parse_deepep_v1.py 口径一致）
+    print('\n=== 轮间一致性 (dispatch us, r1 vs r2) ===', file=sys.stderr)
     bases = sorted({t[:-3] for t in results if t.endswith(('-r1','-r2'))})
     for b in bases:
         a, c = results.get(b+'-r1'), results.get(b+'-r2')
@@ -45,6 +45,7 @@ def main():
             u1, u2 = a['dispatch']['us'], c['dispatch']['us']
             dev = abs(u1-u2)/min(u1,u2)*100
             best = 'r1' if u1 <= u2 else 'r2'
-            print(f'{b:24s} r1={u1:9.2f}us r2={u2:9.2f}us dev={dev:4.1f}% best={best} {"OK" if dev<=5 else "RETRY!"}')
+            print(f'{b:24s} r1={u1:9.2f}us r2={u2:9.2f}us dev={dev:4.1f}% best={best} {"OK" if dev<=5 else "RETRY!"}',
+                  file=sys.stderr)
 
 main()
