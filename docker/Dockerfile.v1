@@ -1,0 +1,157 @@
+# DeepEP V1 on AWS EFA —— p6-b300 (B300 / sm103) 专用镜像（可选测试项）
+#
+# V1（legacy NVSHMEM 路线）在 EFA 上跑不了原版代码：upstream NVSHMEM 没有
+# libfabric 远端传输层，且 DeepEP 原版 internode kernel 硬依赖 IBGDA
+# （直接拼 mlx5 WQE，EFA 无此实现）。本镜像用配对的两个 fork 解决：
+#   1. amazon-contributing/upstream-to-nvshmem @ devel_enriched
+#      —— 给 NVSHMEM 加 libfabric/EFA 传输层 + 多网卡 round-robin
+#   2. rauteric/DeepEP @ b300-kineto-workaround
+#      —— internode kernel 改用 upstream NVSHMEM API（去 IBGDA 依赖）、
+#         去掉无序传输（EFA SRD）下不需要的 fence（即 remove-fence 分支内容），
+#         另加一个 B300 特有修复：Kineto profiler 在 B300 上会返回 0 个事件，
+#         原版 bench 代码解析不到 kernel 时间直接崩；该分支加了 CUDA event
+#         计时兜底（触发时打 WARNING，分项时延为均摊值，合计值仍准确）。
+# 两半配对使用，缺一不可。构建方法依据 whn09/ep-benchmarks-efa 的
+# deepep-v1-efa-b300 参考镜像（B300 实测验证：internode dispatch 109.8 /
+# combine 101.7 GB/s）整理，按本工具包惯例改为钉死 commit SHA 构建、
+# EFA installer 复用本地已校验 tarball。
+#
+# 与 p5en 版（同系列 kit 的 Dockerfile.v1）的差异只有两处：
+#   - DEEPEP_V1_REF：remove-fence 头 -> b300-kineto-workaround 头
+#     （后者 = 前者 + 1 个 Kineto 兜底 commit，只改 tests/utils.py）
+#   - CUDA 架构：90 -> 100（sm_100 的 cubin 可在 sm_103 上运行，
+#     参考镜像用 "90;100" 实测验证；本镜像只跑 b300，去掉 90 省构建时间）
+#
+# 与 V2 镜像（Dockerfile）的关系：完全独立的软件栈——
+#   V2: NCCL GIN + aws-ofi-nccl（EFA-GDA type5），pip NVSHMEM 仅为构建依赖
+#   V1: NVSHMEM libfabric 传输层（CPU proxy 路径，EFA 无 IBGDA）
+#
+# 宿主机前提：NVIDIA 驱动 >= 595（NGC pytorch:26.04 带 CUDA 13.2）。
+# b300 的 DLAMI 出厂驱动即 595+，这一条自动满足（p5en 上才需要专门查）。
+#
+# 构建（需先把 EFA installer tarball 放到本目录）：
+#   docker build -f Dockerfile.v1 -t deepep-v1-efa:dev .
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
+FROM ${BASE_IMAGE}
+
+# 钉死的代码状态（换版本改这里，别写分支名）
+ARG NVSHMEM_REPO=https://github.com/amazon-contributing/upstream-to-nvshmem.git
+ARG NVSHMEM_REF=6601f0bfda6f68caf6b1a65e322112ab090ccd4f
+ARG DEEPEP_V1_REPO=https://github.com/rauteric/DeepEP.git
+ARG DEEPEP_V1_REF=84ccdf6c51a1095a1aed451b36c7ca9b663424ad
+ARG EFA_INSTALLER_VERSION=1.50.0
+ARG GDRCOPY_VERSION=2.5.2
+ARG NVSHMEM_PREFIX=/opt/nvshmem
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVSHMEM_DIR=${NVSHMEM_PREFIX}
+ENV PATH=${NVSHMEM_PREFIX}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${NVSHMEM_PREFIX}/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}
+
+# ---------------------------------------------------------------------------
+# 1) 系统依赖 + EFA 用户态（同一 RUN 层：EFA installer 要 apt 装
+#    environment-modules/tcl，提前清 apt lists 会让它失败）
+# ---------------------------------------------------------------------------
+COPY aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz /tmp/aws-efa-installer.tar.gz
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        git ca-certificates curl wget \
+        build-essential cmake ninja-build \
+        pkg-config autoconf libtool \
+        libnuma-dev libhwloc-dev; \
+    cd /tmp && tar xzf aws-efa-installer.tar.gz; \
+    { grep -q "^## \[${EFA_INSTALLER_VERSION}\]" aws-efa-installer/ChangeLog.md \
+      || { echo "tarball is not EFA installer ${EFA_INSTALLER_VERSION}" >&2; exit 1; }; }; \
+    cd aws-efa-installer; \
+    ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify; \
+    ls /opt/amazon/efa/lib/libfabric* /opt/amazon/efa/include/rdma/fabric.h; \
+    cd / && rm -rf /tmp/aws-efa-installer* /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 2) GDRCopy 用户态库（libgdrapi）。内核模块 gdrdrv 在宿主机；
+#    NVSHMEM 构建检测到 libgdrapi 才会启用 GPU 显存注册给 libfabric 的通路。
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    cd /tmp; \
+    wget -q https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz; \
+    tar xf v${GDRCOPY_VERSION}.tar.gz; \
+    cd gdrcopy-${GDRCOPY_VERSION}; \
+    make -j"$(nproc)" lib lib_install CUDA=/usr/local/cuda PREFIX=/usr/local; \
+    ldconfig; \
+    test -f /usr/local/lib/libgdrapi.so; \
+    cd / && rm -rf /tmp/gdrcopy* /tmp/v${GDRCOPY_VERSION}.tar.gz
+
+# ---------------------------------------------------------------------------
+# 3) 编译 amazon NVSHMEM（libfabric/EFA 传输层）
+#    关键开关：LIBFABRIC=1 是 EFA 通路；IBGDA=0（EFA 没有）；GDRCOPY=1。
+#    CUDA_ARCHITECTURES=100：sm_100 设备代码在 sm_103（B300）上可运行。
+#    末尾 nvshmem-info 是硬门禁：libfabric transport 必须编进去，
+#    否则运行时会静默落回无跨节点传输，测试直接失败或数字无效。
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    mkdir -p /opt/nvshmem-src && cd /opt/nvshmem-src; \
+    git init -q && git remote add origin ${NVSHMEM_REPO}; \
+    git fetch -q --depth 1 origin ${NVSHMEM_REF} && git checkout -q FETCH_HEAD; \
+    [ "$(git rev-parse HEAD)" = "${NVSHMEM_REF}" ]; \
+    NVSHMEM_LIBFABRIC_SUPPORT=1 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    NVSHMEM_IBGDA_SUPPORT=0 \
+    NVSHMEM_IBRC_SUPPORT=0 \
+    NVSHMEM_IBDEVX_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_BUILD_TESTS=0 \
+    NVSHMEM_BUILD_EXAMPLES=0 \
+    NVSHMEM_BUILD_PYTHON_LIB=0 \
+    NVSHMEM_BUILD_PYTHON_DEVICE_LIB=0 \
+    NVSHMEM_USE_NCCL=0 \
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_INSTALL_PREFIX=${NVSHMEM_PREFIX} \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=100 \
+        -DLIBFABRIC_HOME=/opt/amazon/efa \
+        -DGDRCOPY_HOME=/usr/local; \
+    cmake --build build --parallel; \
+    cmake --install build; \
+    ls ${NVSHMEM_PREFIX}/lib/libnvshmem_host.so* ${NVSHMEM_PREFIX}/lib/libnvshmem_device.a; \
+    LD_LIBRARY_PATH=${NVSHMEM_PREFIX}/lib:${LD_LIBRARY_PATH} \
+      ${NVSHMEM_PREFIX}/bin/nvshmem-info -a | tee /tmp/nvshmem-info.log; \
+    grep -qi "libfabric" /tmp/nvshmem-info.log; \
+    cd / && rm -rf /opt/nvshmem-src /tmp/nvshmem-info.log
+
+# ---------------------------------------------------------------------------
+# 4) 编译 rauteric/DeepEP（V1，链接上面的 NVSHMEM）
+#    NGC 26.04 的 CCCL 头在 targets/.../include/cccl 而非 cuda/include，
+#    NVSHMEM 头会带出 cuda/std/tuple，host g++ 编译 deep_ep.cpp 需要 CPATH。
+#    构建期不能 import deep_ep（它 dlopen libcuda.so.1，只有运行时才有），
+#    只验 wheel 元数据和 .so 存在，import 在镜像验收时做。
+# ---------------------------------------------------------------------------
+ENV TORCH_CUDA_ARCH_LIST="10.0"
+ENV CCCL_INCLUDE=/usr/local/cuda/targets/x86_64-linux/include/cccl
+ENV CPATH=${CCCL_INCLUDE}:${CPATH}
+RUN set -eux; \
+    test -f ${CCCL_INCLUDE}/cuda/std/tuple; \
+    mkdir -p /opt/deepep && cd /opt/deepep; \
+    git init -q && git remote add origin ${DEEPEP_V1_REPO}; \
+    git fetch -q --depth 1 origin ${DEEPEP_V1_REF} && git checkout -q FETCH_HEAD; \
+    [ "$(git rev-parse HEAD)" = "${DEEPEP_V1_REF}" ]; \
+    NVSHMEM_DIR=${NVSHMEM_PREFIX} python setup.py bdist_wheel; \
+    pip install --no-deps dist/*.whl; \
+    python -c "import importlib.metadata as m; print('deep_ep wheel:', m.version('deep_ep'))"; \
+    find /usr/local/lib/python3.12/dist-packages -name "deep_ep_cpp*.so" | grep .; \
+    printf 'NVSHMEM_REF=%s\nDEEPEP_V1_REF=%s\n' "${NVSHMEM_REF}" "${DEEPEP_V1_REF}" > /opt/deepep/BUILD_REF
+
+# ---------------------------------------------------------------------------
+# 5) 运行时默认 env（EFA / libfabric 传输层）
+# ---------------------------------------------------------------------------
+ENV NVSHMEM_REMOTE_TRANSPORT=libfabric
+ENV NVSHMEM_LIBFABRIC_PROVIDER=efa
+ENV FI_PROVIDER=efa
+ENV FI_EFA_USE_DEVICE_RDMA=1
+
+WORKDIR /opt/deepep
+CMD ["/bin/bash"]

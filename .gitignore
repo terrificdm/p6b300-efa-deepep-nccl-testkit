@@ -1,0 +1,7 @@
+# 测试产出与敏感文件不入 git
+run/
+*.pem
+aws-efa-installer*.tar.gz
+ssh_known_hosts*
+__pycache__/
+.DS_Store
