@@ -247,6 +247,7 @@ fi_info | grep -c "fabric: efa-direct"         # =16
 cat /sys/class/infiniband/rdmap*/ports/1/rate | sort -u   # 400 Gb/sec 一种
 findmnt /opt/dlami/nvme                        # 已挂载（DLAMI 自动配好）
 find /usr/src -path "*/efa-*/src/efa-abi.h" -exec grep -c COMP_CNTR {} +   # >=1
+grep -o 'PeerMappingOverride=1' /proc/driver/nvidia/params   # 存在（EFA-GDA 硬前提）
 ```
 
 逐项含义与 b300 特有的坑：
@@ -258,6 +259,7 @@ find /usr/src -path "*/efa-*/src/efa-abi.h" -exec grep -c COMP_CNTR {} +   # >=1
 - **每张网卡 400 Gb/s**：这是"每 GPU 线速 100 GB/s"这个分母的证据（16×400÷8）；读到 200 说明这台不是 b300；
 - `/opt/dlami/nvme`：本地盘（JIT cache 挂载点）；
 - **COMP_CNTR 必须查 `/usr/src/efa-*/src/efa-abi.h`**（DKMS 源码），不要 grep `/usr/include/rdma/efa-abi.h`——那是发行版用户态头，装了 1.50 之后它照样是 0 个 COMP_CNTR，会误判。
+- `PeerMappingOverride=1`：EFA-GDA 要把 EFA doorbell BAR 映射进 GPU 地址空间，NVIDIA 驱动默认拒绝，需以 `NVreg_RegistryDwords="PeerMappingOverride=1"` 加载（aws-ofi-nccl `doc/gin-getting-started.md` 列为 P5en/P6-B200/P6-B300 上 EFA-GDA 的硬前提）。DLAMI 预置了它；缺失时 GDAKI 初始化会显式抛异常，不会静默降级——在这里查是把问题从 CB 计费中提前到验收阶段。
 
 `/opt/dlami/nvme` 如果不存在或不是预期状态：**停**，向用户展示磁盘清单，未经批准不许 mkfs/mdadm。
 
@@ -427,7 +429,7 @@ docker run --rm --gpus all --network host --ipc host --privileged   --ulimit mem
 - **type 2 = CPU proxy**：GPU 把发送请求交给 CPU 代理线程，由 CPU 驱动网卡。兼容性好，但多一跳 CPU，时延高。
 - **type 5 = EFA-GDA**：GPU 直接向 EFA 网卡下发 RDMA（GDAKI 方式的 EFA 实现），全程无 CPU 参与。这才是 DeepEP V2 在 EFA 上的完整硬件能力。
 
-`NCCL_GIN_TYPE` 不设置时 NCCL 会落到 CPU proxy。**本手册全部 DeepEP 测试用 type 5**：`NCCL_GIN_TYPE=5` + `NCCL_SYM_GIN_KERNELS_ENABLE=0` 两个变量成对设置（下面的启动命令已含）。正式轮前的 INFO 诊断看到 GDAKI 插件加载且 type 2 被跳过，就是"确实跑在 type 5"的证据。
+`NCCL_GIN_TYPE` 不设置时 NCCL 不做类型过滤，按插件注册顺序选第一个能初始化的 GIN backend（aws-ofi-nccl 的 GDAKI 排在内建 CPU proxy 之前，proxy 只是最后的 fallback）。显式设 `NCCL_GIN_TYPE=5` 的价值在于强制指定路径——type 5 不可用时直接报错，而不是静默换一条路径，保证测的确实是 EFA-GDA。**本手册全部 DeepEP 测试用 type 5**：`NCCL_GIN_TYPE=5` + `NCCL_SYM_GIN_KERNELS_ENABLE=0` 两个变量成对设置（下面的启动命令已含）。正式轮前的 INFO 诊断看到 GDAKI 插件加载且 type 2 被跳过，就是"确实跑在 type 5"的证据。
 
 **b300 特有：`NCCL_IB_HCA=rdmap` 必须在**。该机型 ibverbs 恒有 18 个设备（16 个 EFA `rdmap*` + 2 个非 EFA `ibp*`），不筛选的话 GIN 只建得出 2 个 GDAKI NIC 直接报错。本工具包已把它烧进 V2 镜像 ENV，正常无感；但凡看到 `only 2 GIN GDAKI NICs have been created`，先查这个变量。
 
@@ -556,7 +558,17 @@ done
 -x NCCL_TESTS_SPLIT="AND 0x7"   # 每节点 8 组并行，纯跨节点流量；busbw 要乘组数
 ```
 
-确认走 EFA 的判据（注意正式轮用 `NCCL_DEBUG=WARN`，日志里**没有** INFO 行可看）：一看量级——p6-b300 每节点 16×400 Gbps = 6.4 Tbps ≈ 800 GB/s 聚合（p5en 的 2 倍），8G busbw 达到几百 GB/s 即是 EFA，回落 TCP 只有个位数；二靠 §4.2 的 INFO 诊断已证明本环境 OFI/GDAKI 插件正常加载。若仍需直接证据，用 `NCCL_DEBUG=INFO` 单独加跑一轮诊断（不计入结果）核对 `NET/OFI` 字样。回落到 socket 的数字全部作废。
+正式轮之前跑一个一次性诊断（不计入结果，照抄 §4.2 对 DeepEP 的做法）：任选一个原语（如 all_reduce_perf），把 `-x NCCL_DEBUG=WARN` 换成 `-x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,ENV,NET` 单独跑一轮，日志归档到 `run/logs/`，核对：
+
+```bash
+grep -iE "NET/OFI Selected provider is efa" run/logs/nccl-diag.log
+# 期望：NET/OFI Selected provider is efa, fabric is efa-direct (found 16 nics)
+# b300 的 2 个非 EFA ibp* 设备不属于 efa provider，不计入，此处仍是 16
+```
+
+注意：(a) `-i` 不能省——aws-ofi-nccl ≤1.13 是大写 `Selected Provider`（AWS 官方文档至今仍是旧串），1.14.0 起改为小写并新增 fabric 字段；(b) 只 grep `NET/OFI` 前缀会假阳性——该前缀由日志宏无条件添加（`nccl_ofi_log.h`），插件**初始化失败**的 WARN 也带它，必须核对到 `Selected provider is efa` 这一整句。
+
+确认走 EFA 的判据（注意正式轮用 `NCCL_DEBUG=WARN`，日志里**没有** INFO 行可看）：一看量级——p6-b300 每节点 16×400 Gbps = 6.4 Tbps ≈ 800 GB/s 聚合（p5en 的 2 倍），8G busbw 达到几百 GB/s 即是 EFA，回落 TCP 只有个位数；二靠上面的一次性 INFO 诊断留下的 `Selected provider is efa` 证据。回落到 socket 的数字全部作废。
 
 ### 4.4 DeepEP V1 测试（仅 V1_ENABLED=1）
 
@@ -724,7 +736,7 @@ GDRCopy(V1镜像) v2.5.2 / EFA installer 同上 1.50.0
 [ ] 3.4 fi_pingpong、单机 test_ep 全部 PASS
 [ ] 3.5 各节点 nccl-runner 常驻容器运行中，容器间 ssh(2222) 已通
 [ ] 4.2 DeepEP V2 6 项 × 2 轮完成且轮间一致（≤5%），INFO 诊断证据在（含 Skipping type 2）
-[ ] 4.3 NCCL 4 项 × 2 轮完成且轮间一致，确认走 EFA
+[ ] 4.3 NCCL 4 项 × 2 轮完成且轮间一致，INFO 诊断 `Selected provider is efa` 证据在
 [ ] (V1_ENABLED=1) 3.6 V1 镜像构建/验收/单机 smoke 过，两节点 BUILD_REF 一致
 [ ] (V1_ENABLED=1) 4.4 V1 4 轮完成且轮间一致（Kineto 兜底触发时已注明口径）
 [ ] 4.5 report.md 生成，用户确认数据已外带
