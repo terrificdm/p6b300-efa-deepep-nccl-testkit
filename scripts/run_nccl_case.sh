@@ -19,7 +19,7 @@ cat > /tmp/nccl-inner-$TAG.sh <<EOF
 printf "%s slots=8\n%s slots=8\n" $LEADER_PRIVATE_IP $WORKER_PRIVATE_IP > /root/hostfile
 exec mpirun --allow-run-as-root -np 16 -N 8 --hostfile /root/hostfile \\
   -mca plm_rsh_args "-p 2222" \\
-  -x LD_LIBRARY_PATH -x FI_PROVIDER -x NCCL_NET_PLUGIN -x NCCL_IB_HCA -x NCCL_DEBUG=WARN \\
+  -x LD_LIBRARY_PATH -x FI_PROVIDER -x NCCL_NET_PLUGIN -x NCCL_IB_HCA -x NCCL_NET=OFI -x NCCL_DEBUG=WARN \\
   /opt/nccl-tests/build/$BIN -b 8 -e 8G -f 2 -g 1
 EOF
 

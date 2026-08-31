@@ -527,12 +527,12 @@ mpirun --allow-run-as-root -np <8×节点数，如 16> -N 8 \
   --hostfile /root/hostfile \
   -mca plm_rsh_args "-p 2222" \
   -x LD_LIBRARY_PATH -x FI_PROVIDER -x NCCL_NET_PLUGIN -x NCCL_IB_HCA \
-  -x NCCL_DEBUG=WARN \
+  -x NCCL_NET=OFI -x NCCL_DEBUG=WARN \
   all_reduce_perf -b 8 -e 8G -f 2 -g 1
 ' > run/logs/nccl-<test>-r<n>.log 2>&1
 ```
 
-`FI_PROVIDER=efa`、`NCCL_NET_PLUGIN=ofi`、`NCCL_IB_HCA=rdmap`（b300 必须）、`LD_LIBRARY_PATH`（含 aws-ofi-nccl 和 pip NCCL）都是镜像 ENV 自带的，`-x` 原样转发给远端 rank 即可。hostfile 用各节点**私网 IP**。实际执行用 `scripts/run_nccl_case.sh <tag> <binary>` 驱动——它把内层 mpirun 写成脚本文件 docker cp 进容器再执行，**不要**手工拼 ssh+docker exec+bash 三层引号（实测会静默损坏参数：mpirun 报 executable not found 而二进制其实存在）。每轮结束打印 `CASE_EXIT=0` 和 8G 行的 busbw。完整 8 轮：
+`FI_PROVIDER=efa`、`NCCL_NET_PLUGIN=ofi`、`NCCL_IB_HCA=rdmap`（b300 必须）、`LD_LIBRARY_PATH`（含 aws-ofi-nccl 和 pip NCCL）都是镜像 ENV 自带的，`-x` 原样转发给远端 rank 即可。`NCCL_NET=OFI` 是显式赋值的硬保证——`NCCL_NET_PLUGIN` 只是优先加载外部插件、并不排他，插件初始化失败时 NCCL 会静默回落内建 socket 照常出数字；设了 `NCCL_NET` 后名字不匹配则直接报错退出，防止拿到回落 TCP 的假数据。hostfile 用各节点**私网 IP**。实际执行用 `scripts/run_nccl_case.sh <tag> <binary>` 驱动——它把内层 mpirun 写成脚本文件 docker cp 进容器再执行，**不要**手工拼 ssh+docker exec+bash 三层引号（实测会静默损坏参数：mpirun 报 executable not found 而二进制其实存在）。每轮结束打印 `CASE_EXIT=0` 和 8G 行的 busbw。完整 8 轮：
 
 ```bash
 for r in r1 r2; do
