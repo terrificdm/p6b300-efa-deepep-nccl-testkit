@@ -17,7 +17,7 @@
 | 镜像 pr12 | BUILD_REF b097b03799533c911a1a594fdeb82375fa8c3bd7（PR#1+PR#2） |
 | 镜像 V1 | NVSHMEM_REF 6601f0bfda6f68caf6b1a65e322112ab090ccd4f + DEEPEP_V1_REF 84ccdf6c51a1095a1aed451b36c7ca9b663424ad（NGC pytorch:26.04-py3 base） |
 | 运行时 | deep_ep 2.1.0 / torch 2.13.0+cu130 / NCCL 2.31.2(pip) / CUDA base **13.3.1** / TORCH_CUDA_ARCH_LIST **10.3** |
-| 测试参数 | tokens 8192(prefill)/128(decode), hidden 7168, top-8, 256 experts, **12 SM**, FP8 dispatch+BF16 combine, type5(GDAKI), `NCCL_IB_HCA=rdmap` |
+| 测试参数 | tokens 8192(prefill)/128(decode), hidden 7168, top-8, 256 experts, **12 SM**（§2/§3）与 **24 SM**（§3.1 加测）, FP8 dispatch+BF16 combine, type5(GDAKI), `NCCL_IB_HCA=rdmap` |
 | GIN 后端证据 | INFO 诊断：`Loaded gin plugin Libfabric_GDAKI (v14)`、`Skipping ... type 2: NCCL_GIN_TYPE=5 requested`、`found 16 nics`、Ranks: 2 x 8 |
 
 ## 2. DeepEP V2 结果（16 rank 均值，两轮取优）
@@ -87,7 +87,39 @@
 | reduced combine 时延 | 3781.06 µs | 3785.88 µs（+0.1%） | 3788.62 µs（+0.2%） |
 | reduced combine 带宽 SO/SU (GB/s) | 61.9 / 203.0 | 61.9 / 202.7 | 61.9 / 202.4 |
 
-结论：**official 基线的 decode dispatch 在 B300 上确有回归**（282.1 µs，比同形状 p5en 的 168.6 µs 慢约 1.7 倍），PR#1+#2 打上后 126.1 µs、**省 55.3%**——反超 p5en 的 official 基线，与 p5en 打同样 PR 后的 111.6 µs 基本追平（仍慢约 13%）；`EP_NUM_SUB_PARTS=1` 在 B300 上对 decode 接近中性（+0.5%），对 prefill dispatch 有 -3.5% 的小幅收益（与 p5en 上 sub1 使 prefill 变差 +4.5% 方向相反）。combine/reduced combine 三组全部持平。与 PR 作者"优化目标是小 batch 的 dispatch 切分"的描述一致。prefill dispatch 跨机净带宽 ≈ 58.4 GB/s/GPU ≈ 58% 线速（12 SM 档；参考实测 24 SM 更高，见 §7）。
+结论：**official 基线的 decode dispatch 在 B300 上确有回归**（282.1 µs，比同形状 p5en 的 168.6 µs 慢约 1.7 倍），PR#1+#2 打上后 126.1 µs、**省 55.3%**——反超 p5en 的 official 基线，与 p5en 打同样 PR 后的 111.6 µs 基本追平（仍慢约 13%）；`EP_NUM_SUB_PARTS=1` 在 B300 上对 decode 接近中性（+0.5%），对 prefill dispatch 有 -3.5% 的小幅收益（与 p5en 上 sub1 使 prefill 变差 +4.5% 方向相反）。combine/reduced combine 三组全部持平。与 PR 作者"优化目标是小 batch 的 dispatch 切分"的描述一致。prefill dispatch 跨机净带宽 ≈ 58.4 GB/s/GPU ≈ 58% 线速（12 SM 档；24 SM 实测 69%，见 §3.1）。
+
+### 3.1 24 SM 加测（同矩阵重跑，独立数据点，勿与 12 SM 混排）
+
+同六项 × 2 轮，仅 `--num-sms` 改 24（独立 JIT cache），轮间偏差 ≤0.8%。取优轮，括号为相对同 case 的 12 SM 报告值：
+
+**prefill（8192 tokens）**
+
+| 指标 | official | pr12 | pr12+sub1 |
+|---|--:|--:|--:|
+| dispatch 时延 | 887.27 µs（**-15.3%**） | 882.66 µs（-15.6%） | 911.89 µs（-9.8%） |
+| dispatch 带宽 SO/SU (GB/s) | 137.8 / 450.7 | 138.4 / 453.1 | 134.0 / 438.5 |
+| combine 时延 | 1845.00 µs（**-36.6%**） | 1849.62 µs（-36.2%） | 1705.88 µs（-41.2%） |
+| combine 带宽 SO/SU (GB/s) | 127.9 / 418.7 | 127.5 / 417.5 | 137.6 / 450.0 |
+| reduced combine 时延 | 2259.06 µs（**-40.3%**） | 2259.69 µs（-40.3%） | 2146.69 µs（-43.3%） |
+| reduced combine 带宽 SO/SU (GB/s) | 103.9 / 340.1 | 103.9 / 340.1 | 109.2 / 357.4 |
+
+**decode（128 tokens）**
+
+| 指标 | official | pr12 | pr12+sub1 |
+|---|--:|--:|--:|
+| dispatch 时延 | 241.07 µs（**-14.5%**） | 148.20 µs（**+17.5%**） | 148.34 µs（+17.0%） |
+| dispatch 带宽 SO/SU (GB/s) | 7.4 / 24.3 | 12.2 / 39.7 | 12.2 / 39.7 |
+| combine 时延 | 154.38 µs（-4.5%） | 154.31 µs（-4.4%） | 154.19 µs（-4.4%） |
+| reduced combine 时延 | 166.97 µs（-6.8%） | 167.04 µs（-6.8%） | 167.21 µs（-6.7%） |
+
+三点结论：
+
+1. **prefill 用 24 SM**：三组全面提升——dispatch 快 15%，combine 快 36%，reduced combine 快 40%；dispatch SO 137.8–138.4 GB/s，跨机净带宽 ≈ 69 GB/s/GPU ≈ **69% 线速**（12 SM 档是 58%）。
+2. **decode 的最优 SM 随补丁翻转**：official 在 24 SM 更快（241.1 vs 282.1 µs），PR#1+#2 在 12 SM 更快（126.1 vs 148.2 µs）——SM 工作点不是平台常量，打了 PR 的 decode 应留在 12 SM。
+3. sub1 在 24 SM 上方向再次改变：prefill dispatch 转为小幅变差（+3.3% vs pr12），但 combine/reduced combine 明显受益（-7.8% / -5.0%）。
+
+与独立参考实测（terrificdm/p6b300-efa-deepepv2-test-runbook，2026-08-29，另一 Region 的 2×p6-b300）交叉核对：prefill dispatch 887.3 vs 886.0 µs（+0.1%）、combine 1845.0 vs 1837.3（+0.4%）、decode official 241.1 vs 246.1（-2.0%）、decode PR 148.2 vs 152.4（-2.8%）、线速占比同为 68.9%——两次独立 campaign 互相验证成立。
 
 ## 4. NCCL 结果（16 rank，8 GiB 消息 busbw，两轮取优）
 
@@ -167,8 +199,8 @@ Normal 模式带宽约为 p5en 的 1.7 倍（每卡 200→400 Gb/s），是官�
 
 1. **`PeerMappingOverride=1` 未预置（主机层，测试前修复）**：TESTPLAN §2.5 验收发现 AMI 20260828 没有预置该 NVIDIA 驱动参数（EFA-GDA 硬前提），手工写入 `/etc/modprobe.d/nvidia-peermapping.conf` + `update-initramfs -u` + 重启后复检通过。未占用测试轮次。
 2. **Kineto 兜底未触发**：镜像钉的 b300-kineto-workaround 分支在本驱动栈上不需要兜底（推测该问题与特定驱动/CUDA 组合相关），4 轮 V1 全部走 Kineto 精确计时。
-3. **无 invalid 轮次**：DeepEP V2 12 轮 + NCCL 8 轮 + DeepEP V1 4 轮（另有 V2/V1 单机 smoke、2 个 INFO 诊断轮）全部 exit 0，一次通过。
+3. **无 invalid 轮次**：DeepEP V2 12 轮（12 SM）+ 12 轮（24 SM 加测）+ NCCL 8 轮 + DeepEP V1 4 轮（另有 V2/V1 单机 smoke、2 个 INFO 诊断轮）全部 exit 0，一次通过。
 
 ## 7. 遗留问题
 
-无阻塞项。可选后续：**24 SM prefill 加测**（B300 参考实测 dispatch 快 ~15% / reduced combine 快 ~40%，改 `--num-sms` 一个参数即可，本轮未执行）、4 节点扩展、`NCCL_TESTS_SPLIT` 纯跨节点口径加测。
+无阻塞项。24 SM 加测已完成（§3.1）。可选后续：4 节点扩展、`NCCL_TESTS_SPLIT` 纯跨节点口径加测。

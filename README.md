@@ -61,7 +61,8 @@ DeepEP **combine**（official）：prefill 时延 2908.8 µs、带宽 80.6 / 263
 要点：
 - **decode 必须叠加 PR#1+#2**：官方基线的 decode dispatch 在 B300 上有回归（282.1 µs，比同形状 p5en 的 168.6 µs 慢约 1.7 倍），PR 打上后 126.1 µs、省 55%、基本追平 p5en 打同样 PR 后的 111.6 µs；`EP_NUM_SUB_PARTS=1` 在 B300 上接近中性（p5en 上还能再省几个点）。
 - prefill 三组基本持平，sub1 有 −3.5% 小幅收益（与 p5en 上 sub1 使 prefill 变差方向相反）。
-- 绝对带宽约为 p5en 的 1.4–1.7 倍（每卡 200→400 Gb/s）；算线速占比时分母是每 GPU **100 GB/s**，prefill dispatch 12 SM 档约 58% 线速。参考实测 24 SM 更高（dispatch 快 ~15%），24 SM 加测在 B300 上很值得做（改一个参数即可，见 TESTPLAN §4.2）。
+- 绝对带宽约为 p5en 的 1.4–1.7 倍（每卡 200→400 Gb/s）；算线速占比时分母是每 GPU **100 GB/s**，prefill dispatch 12 SM 档约 58% 线速。
+- **24 SM 加测（同矩阵实测）**：prefill 全面提升——dispatch 887.3 µs（−15.3%）、combine 快 36.6%、reduced combine 快 40.3%，dispatch SO 137.8 GB/s ≈ **69% 线速**；decode 的最优 SM 随补丁翻转——official 在 24 SM 更快（241.1 µs），打 PR 后 12 SM 更快（126.1 vs 148.2 µs）。结论：**prefill 用 24 SM，打了 PR 的 decode 留 12 SM**。换 SM 数只改 `--num-sms` 一个参数（TESTPLAN §4.2）。
 
 DeepEP **V1**（可选项，官方默认参数，与 V2 口径不同不可直接对比）：Normal 模式 dispatch 87.3 (FP8) / 126.1 (BF16)、combine 106.5 GB/s（RDMA）——EFA 上两个方向都超过 100 GB/s，约为官方 IB 参考（43 GB/s）的 2.5–2.9 倍、p5en 的 1.7 倍；Low Latency 模式 dispatch 559 µs / combine 515 µs，与 p5en 量级相近（CPU proxy 路径是瓶颈，不随网卡换代明显变化）。本次实测 Kineto 兜底未触发，分项时延为精确值。
 
