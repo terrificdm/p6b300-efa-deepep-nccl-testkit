@@ -45,7 +45,7 @@ scripts/parse_deepep_v1.py            DeepEP V1 结果解析
 examples/report-sample.md             一次真实 2×p6-b300 测试的报告（已脱敏）
 ```
 
-## 实测参考数字（2×p6-b300.48xlarge，12 SM，type-5/GDAKI，2026-09-02 用本工具包实测）
+## 实测参考数字（2×p6-b300.48xlarge，12 SM，type-5/GDAKI）
 
 DeepEP **dispatch**（带宽为 SO/SU 一对数字：**SO = Scale-Out**，跨节点流量，走 EFA；**SU = Scale-Up**，节点内流量，走 NVLink。同一个 kernel 里两条路径同时发生，分别按各自字节数折算带宽；评估网络能力主要看 SO。单位 GB/s）：
 
