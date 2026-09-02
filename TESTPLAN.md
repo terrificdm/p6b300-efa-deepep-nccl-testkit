@@ -13,7 +13,7 @@
 | ibverbs 设备 | 16 个，全是 EFA | **18 个**：16 个 `rdmap*` + 2 个非 EFA `ibp*`；必须 `NCCL_IB_HCA=rdmap` 筛选 |
 | 子网 IP 消耗 | 每台 16 个 | **每台 1 个**（efa-only 不占 IPv4） |
 | V2 构建 | sm90 / CUDA 13.0.2 | **sm103 / CUDA ≥ 13.3.x**（13.0.2 的 ptxas 在第一次 dispatch 才炸） |
-| V1 计时 | Kineto 正常 | Kineto 返回 0 事件，需带兜底的分支（镜像已钉，见 §3.6） |
+| V1 计时 | Kineto 正常 | 部分驱动组合下 Kineto 返回 0 事件，需带兜底的分支（镜像已钉，见 §3.6；实测 595.91.07 栈上未触发） |
 
 17（网卡）和 18（ibverbs 设备）不矛盾，是两套视角：card0 的 ENA 不是 RDMA 设备，不出现在 `ibv_devinfo -l` 里；那 2 个 `ibp*` 是 B300 机型恒有的板载非 EFA RDMA 设备，与 17 张 ENI 无对应。1+16=17 张卡，16+2=18 个 ibverbs 设备，各自都对——正因为多出这 2 个非 EFA 设备，才必须 `NCCL_IB_HCA=rdmap`。
 
@@ -259,7 +259,14 @@ grep -o 'PeerMappingOverride=1' /proc/driver/nvidia/params   # 存在（EFA-GDA 
 - **每张网卡 400 Gb/s**：这是"每 GPU 线速 100 GB/s"这个分母的证据（16×400÷8）；读到 200 说明这台不是 b300；
 - `/opt/dlami/nvme`：本地盘（JIT cache 挂载点）；
 - **COMP_CNTR 必须查 `/usr/src/efa-*/src/efa-abi.h`**（DKMS 源码），不要 grep `/usr/include/rdma/efa-abi.h`——那是发行版用户态头，装了 1.50 之后它照样是 0 个 COMP_CNTR，会误判。
-- `PeerMappingOverride=1`：EFA-GDA 要把 EFA doorbell BAR 映射进 GPU 地址空间，NVIDIA 驱动默认拒绝，需以 `NVreg_RegistryDwords="PeerMappingOverride=1"` 加载（aws-ofi-nccl `doc/gin-getting-started.md` 列为 P5en/P6-B200/P6-B300 上 EFA-GDA 的硬前提）。DLAMI 预置了它；缺失时 GDAKI 初始化会显式抛异常，不会静默降级——在这里查是把问题从 CB 计费中提前到验收阶段。
+- `PeerMappingOverride=1`：EFA-GDA 要把 EFA doorbell BAR 映射进 GPU 地址空间，NVIDIA 驱动默认拒绝，需以 `NVreg_RegistryDwords="PeerMappingOverride=1"` 加载（aws-ofi-nccl `doc/gin-getting-started.md` 列为 P5en/P6-B200/P6-B300 上 EFA-GDA 的硬前提）。**不要假设 DLAMI 预置了它**——实测 AMI 20260828（Ubuntu 24.04，Description 含 P6-B300）就没有预置；缺失时 GDAKI 初始化会显式抛异常，不会静默降级——在这里查是把问题从 CB 计费中提前到验收阶段。缺失时的修复（每台，重启后复检本清单）：
+
+  ```bash
+  echo 'options nvidia NVreg_RegistryDwords="PeerMappingOverride=1;"' \
+    | sudo tee /etc/modprobe.d/nvidia-peermapping.conf
+  sudo update-initramfs -u
+  sudo reboot
+  ```
 
 `/opt/dlami/nvme` 如果不存在或不是预期状态：**停**，向用户展示磁盘清单，未经批准不许 mkfs/mdadm。
 
@@ -380,7 +387,7 @@ ssh ubuntu@$PUBLIC_IP '
 为什么必须是独立镜像：V1 和 V2 是两条互不相通的软件栈。V2 的跨节点流量走 NCCL GIN（aws-ofi-nccl 的 EFA-GDA）；V1 走 NVSHMEM，而 upstream NVSHMEM 没有 EFA 传输层、DeepEP 原版 internode kernel 又硬依赖 IBGDA（直接拼 mlx5 WQE，EFA 硬件无此实现）——所以 V1 在 EFA 上必须用配对的两个 fork：`amazon-contributing/upstream-to-nvshmem`（给 NVSHMEM 补 libfabric/EFA 传输层）+ `rauteric/DeepEP`（internode kernel 改用 upstream NVSHMEM API 并去掉 EFA SRD 无序传输下多余的 fence）。两半缺一不可，版本钉在附录 B。V2 镜像里虽然也带着 legacy 测试脚本，但那份 legacy 代码走 IBGDA，在 EFA 上跑不起来，不要用它测 V1。
 
 **B300 与 p5en 版 V1 镜像的两处差异**（已写进 Dockerfile.v1，这里说明理由）：
-1. DeepEP ref 钉 `b300-kineto-workaround` 分支头（附录 B 的 `V1_DEEPEP_REF`）而不是 p5en 用的 `remove-fence` 头。两者只差一个 commit：B300 上 Kineto profiler 会返回 0 个事件，原版 bench 代码解析不到 kernel 时间直接崩；该 commit 加了 CUDA event 计时兜底。日志出现 `WARNING: Kineto profiler returned 0 events` 属预期，注意口径变化（见 §4.4 取数）。
+1. DeepEP ref 钉 `b300-kineto-workaround` 分支头（附录 B 的 `V1_DEEPEP_REF`）而不是 p5en 用的 `remove-fence` 头。两者只差一个 commit：**部分驱动组合下** B300 上 Kineto profiler 会返回 0 个事件，原版 bench 代码解析不到 kernel 时间直接崩；该 commit 加了 CUDA event 计时兜底。兜底不触发时行为与 remove-fence 完全一致（2026-09-02 实测的 595.91.07 驱动 + NGC 26.04 栈上即未触发）。日志若出现 `WARNING: Kineto profiler returned 0 events` 属预期，注意口径变化（见 §4.4 取数）。
 2. CUDA 架构 90 → 100：sm_100 的设备代码可在 sm_103（B300）上运行，参考镜像（whn09/ep-benchmarks-efa 的 deepep-v1-efa-b300，B300 实测验证）用的就是这条路。
 
 宿主机无需任何改动（驱动、gdrdrv、EFA 栈都是现成的）。基础镜像 NGC pytorch:26.04 要求驱动 ≥595，b300 的 DLAMI 出厂驱动即满足，构建前顺手核一眼即可：`nvidia-smi --query-gpu=driver_version --format=csv,noheader`。
@@ -651,7 +658,8 @@ b300 专有项在前。
 | `Arguments mismatch for instruction 'mov'` → `ptxas fatal` → `compiler.hpp:239` | 镜像 CUDA base 低于 13.3.x，sm_103 命中 `ptx.cuh` 的 `>= 1000` 分支。**第一次 dispatch 才炸** | 用本目录 Dockerfile 重建（默认 13.3.1）；没有宏能绕 |
 | 线速占比算出约 200% | 分母用了 p5en 的 50 GB/s | b300 每 GPU 100 GB/s（§4.5） |
 | grep COMP_CNTR 得 0 | grep 的是 `/usr/include/rdma/efa-abi.h`（发行版用户态头） | 查 `/usr/src/efa-*/src/efa-abi.h`（§2.5） |
-| V1 日志出现 `Kineto profiler returned 0 events` | **正常**：B300 上 Kineto 拿不到事件，镜像自带兜底生效 | 测试继续有效；Low Latency 分项时延为均摊值，报告注明口径（§4.4） |
+| `/proc/driver/nvidia/params` 无 `PeerMappingOverride=1` | AMI 未预置（实测 20260828 就没有），EFA-GDA 硬前提缺失 | 按 §2.5 的修复命令补 modprobe 配置 + update-initramfs + 重启后复检 |
+| V1 日志出现 `Kineto profiler returned 0 events` | **正常**：部分驱动组合下 B300 上 Kineto 拿不到事件，镜像自带兜底生效（不出现该行则 Kineto 正常，分项时延为精确值） | 测试继续有效；Low Latency 分项时延为均摊值，报告注明口径（§4.4） |
 | 启动时报公网 IP 错误 | 多 ENI 不能自动分配公网 IP | 模板不开公网，启动后绑 EIP |
 | run-instances 报 Placement Group 相关错误 | CB 不支持 PG | 模板里去掉 PG |
 | `fi_info -p efa-direct` 查不到 | efa-direct 是 fabric 名不是 provider 名 | 用 `fi_info \| grep fabric` |
@@ -731,7 +739,7 @@ GDRCopy(V1镜像) v2.5.2 / EFA installer 同上 1.50.0
 [ ] 2.1 keypair 已生成并可解析
 [ ] 2.2 Gate A 已获用户批准，SG/LT 创建完成（17 卡布局），dry-run 返回 DryRunOperation
 [ ] 2.3 Gate B 已获用户批准，N 台 running，每台 17 ENI（1 ENA + 16 efa-only），EIP 绑 card0，compute_cap=10.3
-[ ] 2.4-2.5 EFA 安装 + 重启 + 主机验收全部 PASS（16 rdmap、400 Gb/s、COMP_CNTR）
+[ ] 2.4-2.5 EFA 安装 + 重启 + 主机验收全部 PASS（16 rdmap、400 Gb/s、COMP_CNTR、PeerMappingOverride=1）
 [ ] 3.2-3.3 两个镜像构建完成，各节点 BUILD_REF 一致，ARCH=10.3/CUDA=13.3.1，pr12 的 PR 代码 grep 有输出
 [ ] 3.4 fi_pingpong、单机 test_ep 全部 PASS
 [ ] 3.5 各节点 nccl-runner 常驻容器运行中，容器间 ssh(2222) 已通

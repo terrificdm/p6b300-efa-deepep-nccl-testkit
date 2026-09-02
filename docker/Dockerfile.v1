@@ -8,7 +8,8 @@
 #   2. rauteric/DeepEP @ b300-kineto-workaround
 #      —— internode kernel 改用 upstream NVSHMEM API（去 IBGDA 依赖）、
 #         去掉无序传输（EFA SRD）下不需要的 fence（即 remove-fence 分支内容），
-#         另加一个 B300 特有修复：Kineto profiler 在 B300 上会返回 0 个事件，
+#         另加一个 B300 特有修复：部分驱动/CUDA 组合下 Kineto profiler 在
+#         B300 上会返回 0 个事件（实测 595.91.07 + NGC 26.04 栈上未触发），
 #         原版 bench 代码解析不到 kernel 时间直接崩；该分支加了 CUDA event
 #         计时兜底（触发时打 WARNING，分项时延为均摊值，合计值仍准确）。
 # 两半配对使用，缺一不可。构建方法依据 whn09/ep-benchmarks-efa 的

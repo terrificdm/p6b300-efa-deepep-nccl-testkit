@@ -53,4 +53,4 @@ done
 $SSH ubuntu@$LEADER_PUBLIC_IP "cat ~/case-$TAG.log" > "run/logs/$TAG-leader.log"
 $SSH ubuntu@$WORKER_PUBLIC_IP "cat ~/case-$TAG.log" > "run/logs/$TAG-worker.log"
 echo "$TAG: leader=$L worker=$W"
-grep -m1 "Ranks" "run/logs/$TAG-leader.log" || true
+grep -m1 "^ > Ranks:" "run/logs/$TAG-leader.log" || true
