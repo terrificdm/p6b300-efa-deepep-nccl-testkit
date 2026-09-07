@@ -8,6 +8,15 @@
 
 **[TESTPLAN.md](TESTPLAN.md)** —— 完整执行手册（中文）。结构：前置核对 → Host 部署（Gate A/B）→ 镜像与验收 → 执行测试与报告 → 清理（Gate C）→ 故障速查。
 
+**[架构图](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/)** —— 六张图覆盖从主机准备到测试执行的完整链路，配合 TESTPLAN 看更快：
+[01 总体架构](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/01-overview.html) ·
+[02 主机准备流程](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/02-host-prep.html) ·
+[03 容器镜像与运行](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/03-container-build-run.html) ·
+[04 EFA 软件栈与数据路径](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/04-efa-stack-datapath.html) ·
+[05 测试拉起时序](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/05-test-launch-sequence.html) ·
+[06 软件版本与测试矩阵](https://terrificdm.github.io/p6b300-efa-deepep-nccl-testkit/diagrams/06-versions-test-matrix.html)
+（图索引见 [`diagrams/`](diagrams/)；HTML 源文件在 [`gh-pages`](https://github.com/terrificdm/p6b300-efa-deepep-nccl-testkit/tree/gh-pages/diagrams) 分支，不占 `main` 的体积）
+
 ## 覆盖范围与已知边界
 
 - **DeepEP V2**：`tests/elastic/test_ep.py`，NCCL GIN / EFA-GDA type-5 路径，含 official 与 PR#1+PR#2 优化对比三组。
@@ -34,6 +43,7 @@
 
 ```text
 TESTPLAN.md                           执行手册（主文档）
+diagrams/README.md                    六张架构图的索引（HTML 托管在 gh-pages 分支）
 docker/Dockerfile                     DeepEP V2 + nccl-tests 测试镜像（自包含构建，sm103）
 docker/Dockerfile.v1                  DeepEP V1 测试镜像（可选项）
 scripts/generate_launch_template.py   17 网卡（16 EFA）启动模板生成
