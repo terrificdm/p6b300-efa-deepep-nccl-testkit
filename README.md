@@ -19,7 +19,7 @@
 
 ## 覆盖范围与已知边界
 
-- **DeepEP V2**：`tests/elastic/test_ep.py`，NCCL GIN / EFA-GDA type-5 路径，含 official 与 PR#1+PR#2 优化对比三组。
+- **DeepEP V2**：`tests/elastic/test_ep.py`，NCCL GIN / EFA-GDA type-5 路径，含 official 与 PR#1+PR#2 优化对比三组；可选加测 PR#1+#2+#8+#9 叠加镜像（TESTPLAN §3.7）。
 - **DeepEP V1（可选项）**：legacy NVSHMEM 路线。EFA 上 V1 无法用原版代码（upstream NVSHMEM 无 EFA 传输层、internode kernel 硬依赖 IBGDA），采用配对 fork 构建独立镜像（`amazon-contributing/upstream-to-nvshmem` + `rauteric/DeepEP`）。B300 镜像钉的分支比 p5en 版多一个 commit：V1 测试脚本靠 PyTorch profiler（Kineto）给 kernel 计时，部分较老的驱动/CUDA 组合下它在 B300 上会返回 0 个事件，原版脚本直接崩溃；该 commit 加了 CUDA event 计时兜底作为保险。Kineto 正常时兜底不生效，行为与 p5en 分支完全一致——本 kit 实测（驱动 595.91.07）Kineto 正常，兜底未触发，计时为精确值。覆盖 test_intranode（smoke）/ test_internode（Normal 模式）/ test_low_latency（Low Latency 模式），官方默认参数。测试开始前由用户选择是否启用（`V1_ENABLED`）。
 - NCCL 覆盖 allreduce / alltoall / allgather / reducescatter 四个原语（官方 nccl-tests，容器内 mpirun）。
 - 驱动脚本当前固定 2 节点；4 节点需按 TESTPLAN §4.2 的说明扩展。
@@ -46,6 +46,7 @@ TESTPLAN.md                           执行手册（主文档）
 diagrams/README.md                    六张架构图的索引（HTML 托管在 gh-pages 分支）
 docker/Dockerfile                     DeepEP V2 + nccl-tests 测试镜像（自包含构建，sm103）
 docker/Dockerfile.v1                  DeepEP V1 测试镜像（可选项）
+docker/Dockerfile.pr1289              DeepEP V2 PR1+PR2+PR8+PR9 叠加镜像（可选项，FROM :official 增量构建）
 scripts/generate_launch_template.py   17 网卡（16 EFA）启动模板生成
 scripts/run_deepep_case.sh            DeepEP V2 双节点 case 驱动
 scripts/run_deepep_v1_case.sh         DeepEP V1 双节点 case 驱动

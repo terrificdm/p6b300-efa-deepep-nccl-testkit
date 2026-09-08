@@ -1,0 +1,130 @@
+# DeepEP V2 on AWS EFA —— p6-b300 PR 叠加镜像：PR #1+#2（dispatch 侧）+ PR #8+#9（combine 侧）
+#
+# 与 docker/Dockerfile 的关系：本文件不重建任何工具链。它 FROM 已建好的 :official 镜像
+# （CUDA 13.3.1 / EFA 1.50.0 / NCCL 2.31.2 / torch 2.13 / nccl-tests / sshd / 全部运行时 ENV
+# 原样继承），只把 DeepEP 那一层推倒重来：卸掉 base 里原有的 deep_ep，重新拉两个 PR head、
+# git merge、重编。所以 BASE 传 :official 还是 :pr12 产出字节相同——base 里那份 DeepEP 一进来
+# 就被删了。默认 :official，因为它在 testkit 流程里最先存在，也是报告的参照基线。
+#
+# 构建方法依据 whn09/ep-benchmarks-efa 的 Dockerfile.stack（p5en / b300 实测验证），按本
+# 工具包惯例改写：testkit 用 pip install 装 deep_ep（不是 setup.py install 的 egg），卸载
+# 干净得多；不用 `ADD https://api.github.com/...` 做 cache key——传进来的就是 40 位 sha，
+# build-arg 本身即稳定 cache key，也免得撞 GitHub API 匿名限流。
+#
+# 为什么是 merge 而不是推一条分支再按 sha 建：相对 merge-base 8e7b42e，两侧改动的文件只有
+# README.md 重叠（REF_A 侧：buffer.hpp / combine.hpp / nccl.cu / python_api.cpp / elastic.py /
+# gin_resource_alloc.cuh / hybrid_combine_unordered.cuh；REF_B 侧：compiler.hpp /
+# hybrid_dispatch_unordered.cuh），且 README 的行也不冲突，merge 干净；两种 checkout 顺序
+# 得到同一棵树（tree 6206e3ee）。所以 (REF_A, REF_B) 两个 sha 加一次 merge 就完全决定了这棵树，
+# 任何人拿这两个 sha 都能复现。
+# 代价是 merge commit 的 sha 依赖 author/committer 的名字、邮箱、时间和提交信息——下面把这
+# 五样全部钉死，并且逐字沿用 whn09 的取值，于是各节点、各次构建、以及 whn09 的 b300 报告
+# （runbook_zh.md §9.10）里的 BUILD_REF 都是同一个 a35285f，可以直接逐格对照。
+#
+# 拓扑（amazon-contributing/DeepEP，2026-08-31 的 PR head）：
+#   8e7b42e ─┬─ 9c1f251(official) ─ 54fffef ─ cdec521(PR8) ─ 3c737dc(PR9)   = REF_A
+#            └─ ca76bfc(PR1) ─ bfbdd15(PR2)                                = REF_B
+#   merge(REF_A, REF_B) = a35285f
+# 注意 testkit 附录 B 的 PR12_DEEPEP_REF=b097b03 是 PR#2 rebase 前的 head，和 3c737dc
+# merge 会在 deep_ep/utils/envs.py 冲突，所以 REF_B 必须用 rebase 后的 bfbdd15。两者的
+# PR1/PR2 代码改动逐字等价（hybrid_dispatch_unordered.cuh 相同，compiler.hpp 只差注释换行），
+# 但底座不同：b097b03 基于 cc55cce，bfbdd15 基于 main 的 8e7b42e，多出 e3fd436（st.bulk
+# 64 位操作数，ptxas 兼容性）、8e7b42e（单机路径 GIN ctx count）以及 envs.py 的 RDMA 速率探测
+# 失败改为 raise。双节点、显式 --num-sms 的正式测试不触发这三处，性能等价；但若 :pr12 仍是
+# b097b03，报告里 pr12 与本镜像并列时须分别标注 sha，不能写成同一底座。
+#
+# 构建（每台节点，在 ~/deepep-image 里，与镜像 1/2 同一目录同一句式；见 TESTPLAN §3.7）：
+#   docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
+# 本文件没有 COPY/ADD，不需要 build context；不想让 docker 把目录里 650 MB 的 tarball
+# 发给 daemon 的话也可以从 stdin 读：
+#   docker build -t deepep-v2-efa:pr1289 - < Dockerfile.pr1289
+
+ARG BASE=deepep-v2-efa:official
+FROM ${BASE}
+
+# FROM 之前的 ARG 出了作用域就没了；在 stage 内不带值重新声明即可拿到默认值或 --build-arg
+# 传入值（Docker 文档记载的行为），用来把 base 记进镜像供报告的环境快照引用。
+ARG BASE
+
+# 钉死的两个 PR head（换版本改这里或传 --build-arg，别写分支名）
+ARG REF_A=3c737dcf0da5889ba7efd26e05b4808307cc38af
+ARG REF_B=bfbdd15ff448783f877cb2210cb3246c8452b05e
+# merge 结果的预期 sha。默认值对应上面两个默认 REF；改了 REF 就必须同时改它
+# （或传空串跳过检查）。它是"两节点 BUILD_REF 必须一致"这条验收规则的构建期版本。
+ARG EXPECT_BUILD_REF=a35285f0af98856625e542df24bd17a985bc05d9
+
+# ---------------------------------------------------------------------------
+# 1) 卸掉 base 里原有的那份 deep_ep，连源码树一起删，再断言 import 不进来。
+#    不卸干净就装，会得到一个"看起来是叠加版、实际跑的是 base 原有代码"的镜像，
+#    日志里没有任何迹象。
+#    WORKDIR 是 /workspace（不是 /opt/DeepEP），所以这条负断言不会被源码目录里的
+#    deep_ep/ 误导。
+#    开头先断言 base 是 sm103 编的：本文件是 b300 专用，防止被拷到 p5en 版工具包后用 sm90 的
+#    base 建出一个 tag 写着 b300 的镜像（EP_BUILD_ARCH 由 testkit 主 Dockerfile 写进 ENV）。
+#    pip3 uninstall 加 || true 只是让"BASE 里本来没装 deep_ep"这种情况不报费解的错；真正的
+#    门禁是紧随其后的负断言，卸载真失败照样会被拦住，并把残留路径打出来。
+#    set -x：断言链一旦失败，构建日志里最后一条回显的命令就是失败点，不用猜。
+# ---------------------------------------------------------------------------
+RUN set -x \
+    && [ "$EP_BUILD_ARCH" = "10.3" ] || { echo "base image EP_BUILD_ARCH=$EP_BUILD_ARCH, not 10.3 (b300/sm103)" >&2; exit 1; } \
+    && { pip3 uninstall -y --break-system-packages deep_ep || true; } \
+    && rm -rf /opt/DeepEP \
+    && if python3 -c 'import deep_ep' 2>/dev/null; then \
+           echo "deep_ep still importable after uninstall: $(python3 -c 'import deep_ep;print(deep_ep.__path__)')" >&2; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# 2) 重拉、merge、重编。
+#    - fetch 不带 --depth：merge 需要 merge-base，浅历史可能没有共同祖先（实测全量
+#      fetch 这两个 sha 只有约 4 MB）。按裸 sha fetch 要求该 commit 仍可从 GitHub 的某个
+#      ref（含 refs/pull/N/head）到达；若 PR 被 rebase/关闭后 head 不再可达，这里会报
+#      `Server does not allow request for unadvertised object`——那是上游变了，不是网络问题。
+#    - GIT_*_DATE / user.* / -m 五样钉死且与 whn09 逐字相同（见文件头）。
+#    - 安装命令与 docker/Dockerfile 第 4 步逐字相同；TORCH_CUDA_ARCH_LIST=10.3、
+#      EP_BUILD_ARCH/EP_BUILD_CUDA、EP_JIT_CACHE_DIR 等 ENV 从 base 继承，不重复写。
+# ---------------------------------------------------------------------------
+RUN mkdir -p /opt/DeepEP && cd /opt/DeepEP && git init -q \
+    && git remote add origin https://github.com/amazon-contributing/DeepEP.git \
+    && git fetch -q origin "${REF_A}" "${REF_B}" \
+    && git checkout -q "${REF_A}" \
+    && GIT_AUTHOR_DATE="2026-08-31T00:00:00 +0000" \
+       GIT_COMMITTER_DATE="2026-08-31T00:00:00 +0000" \
+       git -c user.email=bench@local -c user.name=bench merge --no-edit "${REF_B}" \
+           -m "measure: stack ${REF_B} onto ${REF_A}" \
+    && git rev-parse HEAD > /opt/DeepEP/BUILD_REF \
+    && printf '%s %s\n' "${REF_A}" "${REF_B}" > /opt/DeepEP/BUILD_REF_PARENTS \
+    && printf '%s\n' "${BASE}" > /opt/DeepEP/BUILD_BASE \
+    && echo "stacked ${REF_B} onto ${REF_A} -> $(cat /opt/DeepEP/BUILD_REF)" \
+    && { [ -z "${EXPECT_BUILD_REF}" ] || [ "$(cat /opt/DeepEP/BUILD_REF)" = "${EXPECT_BUILD_REF}" ] \
+         || { echo "BUILD_REF $(cat /opt/DeepEP/BUILD_REF) != expected ${EXPECT_BUILD_REF}: REF_A/REF_B changed or merge identity drifted" >&2; exit 1; }; } \
+    && git submodule update -q --init --recursive --depth 1 \
+    && NCCL_ROOT="$(python3 -c 'import nvidia.nccl;print(list(nvidia.nccl.__path__)[0])')" \
+    && test -f "$NCCL_ROOT/include/nccl_device.h" \
+    && EP_NCCL_ROOT_DIR="$NCCL_ROOT" \
+       LIBRARY_PATH="$NCCL_ROOT/lib:${LIBRARY_PATH:-}" \
+       pip3 install --break-system-packages --no-build-isolation -v . \
+    && rm -rf build
+
+# ---------------------------------------------------------------------------
+# 3) 装完当场验：四组改动都要在装出来的那份里（JIT 运行时读的是 installed package
+#    下的 include/，不是 /opt/DeepEP 源码树；host 侧的 JIT env 转发编进 _C.so）。
+#    任一条不成立就让 build 失败，而不是产出一个安静地只带一半补丁的镜像。
+#      EP_NUM_SUB_PARTS 在 _C.so 里          -> PR #1（JIT env 转发；official 没有）
+#      kMinTokensPerPart 在 dispatch 头里    -> PR #2（part clamp；official 没有）
+#      kNumFwWarpsPerChannel 在 combine 头里 -> PR #8+#9（forward-warp 配对；official/pr12 都没有）
+#      kDefaultGinContextCnt = 13            -> PR #9（QP 11→13；跑起来日志里是 #QPs: 13/13）
+#    kMaxParts 不能用来断言——main 上也有它。set -x 同第 1 步：失败点即最后回显的那条。
+# ---------------------------------------------------------------------------
+RUN set -x \
+    && PKG="$(python3 -c 'import deep_ep,os;print(os.path.dirname(deep_ep.__file__))')" \
+    && echo "installed deep_ep at $PKG" \
+    && case "$PKG" in /opt/DeepEP*) echo "deep_ep resolves to the source tree, not an installed package" >&2; exit 1;; esac \
+    && python3 -c 'import deep_ep, deep_ep._C' \
+    && SO="$(find "$PKG" -maxdepth 1 -name '_C*.so' | head -1)" && test -n "$SO" \
+    && strings "$SO" | grep -q EP_NUM_SUB_PARTS \
+    && grep -q kMinTokensPerPart    "$PKG/include/deep_ep/impls/hybrid_dispatch_unordered.cuh" \
+    && grep -q kNumFwWarpsPerChannel "$PKG/include/deep_ep/impls/hybrid_combine_unordered.cuh" \
+    && grep -q 'kDefaultGinContextCnt *= *13' "$PKG/include/deep_ep/common/gin_resource_alloc.cuh" \
+    && test -s /opt/DeepEP/BUILD_REF_PARENTS
+
+# 运行时默认值（EP_NIC_NAME / NCCL_IB_HCA=rdmap / NCCL_NET_PLUGIN 等）与 WORKDIR=/workspace
+# 全部继承自 base，无需重复。

@@ -32,6 +32,7 @@
 ```text
 docker/Dockerfile                     # DeepEP V2+nccl-tests 测试镜像（自包含构建，sm103）
 docker/Dockerfile.v1                  # DeepEP V1 测试镜像（可选项，见 §3.6）
+docker/Dockerfile.pr1289              # DeepEP V2 PR1+PR2+PR8+PR9 叠加镜像（可选项，见 §3.7）
 scripts/generate_launch_template.py   # 生成 17 网卡（16 EFA）的启动模板 JSON
 scripts/run_deepep_case.sh            # DeepEP V2 双节点 case 驱动（预检/启动/轮询/收日志）
 scripts/run_deepep_v1_case.sh         # DeepEP V1 双节点 case 驱动（同骨架，V1 镜像与脚本）
@@ -296,6 +297,10 @@ docker build -t deepep-v2-efa:official .
 # 镜像 2：PR1+PR2 优化版（同一个 Dockerfile，只换 DEEPEP_REF；PR2 分支包含 PR1）
 docker build --build-arg DEEPEP_REF=<PR12_DEEPEP_REF，见附录B> \
   -t deepep-v2-efa:pr12 .
+
+# 镜像 3（可选）：PR1+PR2+PR8+PR9 叠加版（另一个 Dockerfile，FROM :official 增量构建，
+# 须在镜像 1 之后；说明与验收见 §3.7）
+docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
 ```
 
 两个镜像出自同一个 Dockerfile，除 DeepEP 代码 commit 外完全相同（同 EFA 栈、同 NCCL、同 torch），这是 §4.2 三组对比可比性的基础。首个镜像构建约 15-20 分钟（约 21 GB）；第二个命中前面所有层的 cache，只重拉代码重编译，约 5-10 分钟。多台并行构建，不要串行等。构建日志存 `run/host/<role>-image-build.txt`。镜像里装了什么、为什么（版本约束来自 AWS 官方 README）：
@@ -419,6 +424,55 @@ docker run --rm --gpus all --network host --ipc host --privileged   --ulimit mem
 
 判定：exit 0。存 `run/logs/v1-intranode-smoke-leader.log`，不进对比表。
 
+### 3.7 DeepEP V2 PR 叠加镜像 pr1289（可选）
+
+**为什么叠加**。`amazon-contributing/DeepEP` 上有两组未合并的性能 PR，动的是不同的 kernel：PR #1+#2 优化 **dispatch**（§4.2 已详述，`:pr12` 镜像），PR #8+#9 优化 **combine**——
+
+| PR | 改动 |
+|---|---|
+| #8 | scale-out 的 put 改为 remote-first 两遍扫描调度，抵消节点间的启动抖动 |
+| #9 | 去掉 `num_channels_per_sm ≤ 4` 的 clamp（12 SM 下 48 → 96 channel）、GIN QP 11 → 13、forward warp 两两配对协作提交 |
+
+两组 PR 改的文件除 README 外不相交，`git merge` 无冲突，叠加后各取所长：combine 收益全部来自 #8+#9，dispatch 收益基本来自 #1+#2。whn09/ep-benchmarks-efa 在 2×p6-b300（12 SM、type 5、默认 knob）上的实测量级供参考：叠加版 decode dispatch 277.5 → 118.1 µs（−57.4%）、decode 层总时间（dispatch + reduced combine）−37.5%、prefill 层总时间 −7.7%——是 b300 上测到的最优 decode 点。本镜像就是给测试矩阵加第四个数据点：official → pr12 → pr1289。
+
+**镜像是什么**。`docker/Dockerfile.pr1289` 在 `:official` 之上只重做 DeepEP 一层：卸掉原有的 deep_ep，把 PR #9 head（含 #8）与 PR #2 head（含 #1）做 git merge 后重编，工具链层与 `:official` 逐字节相同。merge 的 sha 由两个 PR head 加钉死的提交身份完全决定，各节点及 whn09 得到的都是同一个 BUILD_REF（附录 B 的 `PR1289_BUILD_REF`）；构建期自带 sha 校验与四条内容断言，能建出来就说明四个 PR 都在。细节见文件头注释。
+
+**构建**（每台节点，`:official` 建好之后；不依赖 `:pr12`；命中缓存约 5-10 分钟，日志存 `run/host/<role>-image-build-pr1289.txt`）：
+
+```bash
+cd ~/deepep-image && docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
+```
+
+**验收**（每台，追加到 `run/host/<role>-image-validation.txt`）：先把 §3.3 那段 `for` 循环对 `deepep-v2-efa:pr1289` 跑一遍（`BUILD_REF` 须等于附录 B 的 `PR1289_BUILD_REF`，其余判据同——工具链层继承自 `:official`，理应全同），再加下面这段确认四个 PR 都在**已安装包**里（JIT 运行时读的是它，不是 `/opt/DeepEP` 源码树）：
+
+```bash
+docker run --rm --entrypoint bash deepep-v2-efa:pr1289 -lc '
+cat /opt/DeepEP/BUILD_REF_PARENTS   # 两个 PR head：3c737dc...（#9 含 #8） bfbdd15...（#2 含 #1）
+cat /opt/DeepEP/BUILD_BASE          # deepep-v2-efa:official
+PKG=$(python3 -c "import deep_ep,os;print(os.path.dirname(deep_ep.__file__))")
+strings $PKG/_C*.so | grep -c EP_NUM_SUB_PARTS                                            # PR1：>=1
+grep -c kMinTokensPerPart     $PKG/include/deep_ep/impls/hybrid_dispatch_unordered.cuh    # PR2：>=1
+grep -c kNumFwWarpsPerChannel $PKG/include/deep_ep/impls/hybrid_combine_unordered.cuh     # PR8/9：>=1
+grep -o "kDefaultGinContextCnt *= *[0-9]*" $PKG/include/deep_ep/common/gin_resource_alloc.cuh   # PR9：= 13
+'
+```
+
+四条 grep 任一为 0 或 QP 不是 13，说明镜像不是本 Dockerfile 建出来的（构建期同样四条断言不可能放过），停下查 `docker history`。两节点 `BUILD_REF` / `BUILD_REF_PARENTS` 必须逐字一致。再对 `:pr1289` 跑一次 §3.4(b) 的单机 smoke（镜像名换掉即可，日志存 `run/logs/single-node-pr1289-<role>.log`）：exit 0，且 Config 块显示 `#QPs: 13/13`（official/pr12 为 11/11）——这既是 PR #9 的运行时证据，也提前确认 merge 后的 kernel 能在 B300 上 JIT 通过，别把这个风险留到双节点正式轮。
+
+**跑测**（驱动脚本与解析器原样可用；JIT cache 目录独立；端口接在 §4.2 的 12 轮之后，V1 的 8331 起之前）：
+
+```bash
+bash scripts/run_deepep_case.sh pr1289-prefill-r1 pr1289 pr1289_sm12 8192 8323
+bash scripts/run_deepep_case.sh pr1289-decode-r1  pr1289 pr1289_sm12  128 8324
+bash scripts/run_deepep_case.sh pr1289-prefill-r2 pr1289 pr1289_sm12 8192 8325
+bash scripts/run_deepep_case.sh pr1289-decode-r2  pr1289 pr1289_sm12  128 8326
+```
+
+- `EP_NUM_SUB_PARTS=1` 在此镜像上**不作为优化配置测**：whn09 b300 实测它使 prefill dispatch 变差约 +100 µs、decode 中性。
+- 报告里 pr1289 与 pr12 并列时分别标注 BUILD_REF：pr1289 用的是 rebase 后的 PR #2 head，与附录 B 的 `PR12_DEEPEP_REF` 底座不同（后者建在更早的 cc55cce 上，前者建在 main 的 8e7b42e 上；PR 补丁本身相同，双节点性能等价，见 Dockerfile 文件头）。§4.5 的三组对比表加一列 pr1289 即可。
+
+参考（执行本节不需要访问）：whn09/ep-benchmarks-efa [runbook_zh.md](https://github.com/whn09/ep-benchmarks-efa/blob/main/deepep-v2-efa-official/docs/runbook_zh.md) §4.2（叠加镜像建法）、§9.7–9.10（p5en / b300 实测与可加性分析）；PR [#1](https://github.com/amazon-contributing/DeepEP/pull/1) [#2](https://github.com/amazon-contributing/DeepEP/pull/2) [#8](https://github.com/amazon-contributing/DeepEP/pull/8) [#9](https://github.com/amazon-contributing/DeepEP/pull/9)。
+
 ---
 
 ## 4. 执行测试与生成报告
@@ -465,7 +519,7 @@ bash scripts/run_deepep_case.sh pr12-sub1-prefill-r2  pr12     pr12_sm12     819
 bash scripts/run_deepep_case.sh pr12-sub1-decode-r2   pr12     pr12_sm12      128 8322 "-e EP_NUM_SUB_PARTS=1"
 ```
 
-每轮结束脚本打印 `CASE_EXIT=0` 和 `Ranks: 2 x 8`——两者都在才算这轮有效。
+每轮结束脚本打印 `CASE_EXIT=0` 和 `Ranks: 2 x 8`——两者都在才算这轮有效。可选加测：`:pr1289` 镜像（PR1+PR2+PR8+PR9 叠加）的 4 轮命令与注意事项见 §3.7，接在上面 12 轮之后执行，端口从 8323 起。
 
 脚本内部执行的就是下面这条 docker run + torchrun（列出来供人工核对/单独执行；由 Controller 经 ssh 下发时，末尾 `>` 重定向写在 Controller 侧，日志直接落 `run/logs/`）。跑之前在任一节点 `ibv_devinfo -l` 看一眼设备名：镜像默认 `EP_NIC_NAME=rdmap101s0`，如果实际列表里没有这个名字，给 docker run 加 `-e EP_NIC_NAME=<列表里第一个 rdmap 名>`（脚本的话改 `launch()` 里的 -e 部分）。
 
@@ -710,6 +764,10 @@ DeepEP PR1+PR2  amazon-contributing/DeepEP @ b097b03799533c911a1a594fdeb82375fa8
                 想测更新的代码：查当天 fork main 的 SHA，构建时传
                 `--build-arg DEEPEP_REF=<sha>`——仍然钉 SHA，不要写 main，
                 否则各节点分别构建时可能拿到不同代码导致 BUILD_REF 不一致
+DeepEP PR1289   amazon-contributing/DeepEP：PR #9 head 3c737dcf0da5889ba7efd26e05b4808307cc38af（含 #8）
+                merge PR #2 head bfbdd15ff448783f877cb2210cb3246c8452b05e（含 #1，rebase 后）
+                -> BUILD_REF a35285f0af98856625e542df24bd17a985bc05d9（PR1289_BUILD_REF；
+                   Dockerfile.pr1289 的默认值并在构建期校验。可选项，见 §3.7）
 NCCL(pip)       2.31.2 / NVSHMEM(pip) 3.7.2 / torch 2.13.0+cu130
 CUDA base       13.3.1-devel-ubuntu24.04 / TORCH_CUDA_ARCH_LIST=10.3（B300 / sm_103）
                 sm_103 的 CUDA 下限是 13.3.x（硬约束，见 §3.2）；torch wheel 仍用 cu130，
@@ -747,6 +805,7 @@ GDRCopy(V1镜像) v2.5.2 / EFA installer 同上 1.50.0
 [ ] 4.3 NCCL 4 项 × 2 轮完成且轮间一致，INFO 诊断 `Selected provider is efa` 证据在
 [ ] (V1_ENABLED=1) 3.6 V1 镜像构建/验收/单机 smoke 过，两节点 BUILD_REF 一致
 [ ] (V1_ENABLED=1) 4.4 V1 4 轮完成且轮间一致（Kineto 兜底触发时已注明口径）
+[ ] (可选) 3.7 pr1289 镜像构建/验收/单机 smoke 过，两节点 BUILD_REF 一致且等于 PR1289_BUILD_REF，4 轮完成且轮间一致
 [ ] 4.5 report.md 生成，用户确认数据已外带
 [ ] 5 Gate C 已获批准，资源清理完毕并复核（含 17×N ENI 消失）
 ```
