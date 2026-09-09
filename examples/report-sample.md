@@ -204,3 +204,51 @@ Normal 模式带宽约为 p5en 的 1.7 倍（每卡 200→400 Gb/s），是官�
 ## 7. 遗留问题
 
 无阻塞项。24 SM 加测已完成（§3.1）。可选后续：4 节点扩展、`NCCL_TESTS_SPLIT` 纯跨节点口径加测。
+
+## 8. 附录：与第三方独立实测的交叉核对（whn09/ep-benchmarks-efa）
+
+**本附录不是本次实测数据。** 它引用另一支团队在同型号硬件、同软件栈、同参数上独立完成的测试，用来作为数据参考和校准：**本附录的任何数字都不参与 §2–§5 的结论，那些结论只依据本次实测。**
+
+12 SM、同参数、同口径（WN 3 轮均值，16 rank）。**括号内为相对 official 的变化**；`layer total` = dispatch 时延 + reduced combine 时延，即一层 MoE 的通信总时间。SO/SU 两列由本 kit 的 `scripts/parse_deepep.py` 重跑上游原始日志得到（上游 `tables.txt` 只发布 SO 的 per-rank 区间、未发布 SU 与均值），时延与上游发布值逐格吻合。
+
+**decode（128 tokens）**
+
+| 指标 | official | pr12 | pr12+sub1 | pr89 | pr1289 (stack) | pr1289+sub1 |
+|---|--:|--:|--:|--:|--:|--:|
+| dispatch 时延 | 277.49 | 127.83 | 127.73 | 209.69（−24.4%） | **118.09（−57.4%）** | 118.68（−57.2%） |
+| dispatch SO/SU | 6.4 / 21.1 | 14.1 / 45.9 | 14.1 / 46.0 | 8.6 / 28.1 | 15.3 / 49.8 | 15.2 / 49.5 |
+| combine 时延 | 162.41 | 162.16 | 162.03 | 160.32（−1.3%） | 160.25（−1.3%） | 160.29（−1.3%） |
+| combine SO/SU | 21.2 / 69.4 | 21.3 / 69.5 | 21.4 / 69.5 | 21.6 / 70.5 | 21.8 / 70.5 | 21.6 / 70.5 |
+| reduced combine 时延 | 180.59 | 180.52 | 180.49 | 168.69（−6.6%） | **168.34（−6.8%）** | 168.55（−6.7%） |
+| reduced combine SO/SU | 19.1 / 62.4 | 19.1 / 62.4 | 19.1 / 62.5 | 20.5 / 66.9 | 20.6 / 67.0 | 20.6 / 67.0 |
+| layer total | 458.1 | 308.4 | 308.2 | 378.4（−17.4%） | **286.4（−37.5%）** | 287.2（−37.3%） |
+
+（WN 另有 main+sub1 decode 点：dispatch 278.93 / combine 162.47 / reduced 180.75 → sub1 在未打补丁的基线上也是中性。）
+
+**prefill（8192 tokens）**
+
+| 指标 | official | pr12 | pr12+sub1 | pr89 | pr1289 (stack) | pr1289+sub1 |
+|---|--:|--:|--:|--:|--:|--:|
+| dispatch 时延 | 1056.21 | 1054.94 | 1015.96 | 947.63（−10.3%） | **947.84（−10.3%）** | 1050.13（−0.6%） |
+| dispatch SO/SU | 115.8 / 378.5 | 115.9 / 379.0 | 120.4 / 393.6 | 128.9 / 421.9 | 128.9 / 421.9 | 116.4 / 380.7 |
+| combine 时延 | 2927.42 | 2924.46 | 2929.39 | 2817.41（−3.8%） | 2816.02（−3.8%） | **2808.06（−4.1%）** |
+| combine SO/SU | 80.0 / 262.0 | 80.1 / 262.3 | 80.0 / 261.9 | 83.3 / 272.4 | 83.2 / 272.5 | 83.5 / 273.2 |
+| reduced combine 时延 | 3811.21 | 3804.61 | 3807.65 | 3549.83（−6.9%） | **3545.71（−7.0%）** | 3548.81（−6.9%） |
+| reduced combine SO/SU | 61.5 / 201.3 | 61.6 / 201.7 | 61.6 / 201.5 | 66.0 / 216.2 | 66.2 / 216.5 | 66.1 / 216.2 |
+| layer total | 4867.4 | 4859.5 | 4823.6 | 4497.5（−7.6%） | **4493.5（−7.7%）** | 4598.9（−5.5%） |
+
+`EP_NUM_SUB_PARTS=1` 在两组上方向相反：在 pr12 上它使 prefill dispatch 快 3.7%（与 §3 实测的 −3.5% 同向），在 pr1289 上使其**慢 102.3 µs**（947.84 → 1050.13），把 PR#8+#9 的 dispatch 收益整个吃掉——**pr1289 上不应开 sub1**。
+
+本表各列对应上游的命名：official = `main`（`54fffef`）、pr12 = `PR #1+#2`（`bfbdd15`）、pr89 = `PR #8+#9`（`3c737dc`）、pr1289 = `stack`（`a35285f`，与本 kit `docker/Dockerfile.pr1289` 的 `PR1289_BUILD_REF` 同 sha）。**pr89 / pr1289 / pr1289+sub1 三列本次未测**，仅供定位；补测方法见 TESTPLAN §3.7。
+
+**数据来源**：上游仓库固定在 commit [`0e6a0b5`](https://github.com/whn09/ep-benchmarks-efa/tree/0e6a0b538a86b555c65d3c8187ff61743ec0504c)（2026-09-04），以下链接均为不可变 permalink：
+
+| 内容 | 链接 |
+|---|---|
+| 12 SM 六组对比实测（本附录主要来源，2026-09-03） | [`results/b300_stack_20260903/`](https://github.com/whn09/ep-benchmarks-efa/tree/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/b300_stack_20260903) |
+| ├ 上游发布的汇总表 | [`tables.txt`](https://github.com/whn09/ep-benchmarks-efa/blob/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/b300_stack_20260903/tables.txt) |
+| ├ 原始日志（82 个，16/16 rank × 3 轮 × 7 种镜像/参数组合） | [`logs/`](https://github.com/whn09/ep-benchmarks-efa/tree/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/b300_stack_20260903/logs) |
+| ├ rank 完整性 / 口径自检 | [`verify.txt`](https://github.com/whn09/ep-benchmarks-efa/blob/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/b300_stack_20260903/verify.txt) |
+| └ 表格生成器（`layer total` 的定义在 `def layer()`） | [`p5en_stack_20260831/make_stack_tables.py#L100-L103`](https://github.com/whn09/ep-benchmarks-efa/blob/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/p5en_stack_20260831/make_stack_tables.py#L100-L103) |
+| 24 SM 加测（本附录未引用，备查；每格 n=1） | [`results/b300_sm24_20260903/tables.txt`](https://github.com/whn09/ep-benchmarks-efa/blob/0e6a0b538a86b555c65d3c8187ff61743ec0504c/deepep-v2-efa-official/results/b300_sm24_20260903/tables.txt) |
+| 上游侧结论与横向对比 | [`README.md`](https://github.com/whn09/ep-benchmarks-efa/blob/0e6a0b538a86b555c65d3c8187ff61743ec0504c/README.md) |
