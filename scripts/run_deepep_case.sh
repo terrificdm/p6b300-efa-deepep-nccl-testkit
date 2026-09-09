@@ -2,7 +2,7 @@
 # 跑一个 DeepEP 双节点 case：预检 -> worker/leader 后台启动 -> 轮询 -> 回收日志
 # B300 说明：NCCL_IB_HCA=rdmap 已烧进镜像 ENV（该机型 ibverbs 有 18 个设备，
 # 16 rdmap + 2 ibp，不筛选 GIN 建不齐 GDAKI NIC），这里无需再传。
-# 用法: run_deepep_case.sh <tag> <image:official|pr12> <cache_dir> <tokens> <port> [extra_env]
+# 用法: run_deepep_case.sh <tag> <image:official|pr12|pr1289> <cache_dir> <tokens> <port> [extra_env]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source run/state.env

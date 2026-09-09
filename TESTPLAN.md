@@ -303,7 +303,7 @@ docker build --build-arg DEEPEP_REF=<PR12_DEEPEP_REF，见附录B> \
 docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
 ```
 
-两个镜像出自同一个 Dockerfile，除 DeepEP 代码 commit 外完全相同（同 EFA 栈、同 NCCL、同 torch），这是 §4.2 三组对比可比性的基础。首个镜像构建约 15-20 分钟（约 21 GB）；第二个命中前面所有层的 cache，只重拉代码重编译，约 5-10 分钟。多台并行构建，不要串行等。构建日志存 `run/host/<role>-image-build.txt`。镜像里装了什么、为什么（版本约束来自 AWS 官方 README）：
+两个镜像出自同一个 Dockerfile，除 DeepEP 代码 commit 外完全相同（同 EFA 栈、同 NCCL、同 torch），这是 §4.2 三组对比可比性的基础。首个镜像构建约 8-15 分钟（32 vCPU 实测 8 分钟，约 14.4 GB；主要耗时是拉 CUDA base 和 pip 装 torch，不是编译）；第二个命中前面所有层的 cache，只重拉代码重编译，约 2-5 分钟。多台并行构建，不要串行等。构建日志存 `run/host/<role>-image-build.txt`。镜像里装了什么、为什么（版本约束来自 AWS 官方 README）：
 - **DeepEP V2（amazon-contributing/DeepEP fork，固定 commit）**：AWS 官方指定的 EFA 版本——EFA GDAKI 需要 fork 里的 unordered kernels，deepseek-ai 原版的 ordered kernels 在 EFA 上不正确。官方测试脚本 `tests/elastic/test_ep.py` 原样在 fork 内，测试方法不变
 - **PyTorch 2.13 + CUDA 13.3.1 devel 基础镜像**：DeepEP V2 运行时 + JIT 编译要用的 nvcc。**13.3.1 是 sm_103 的硬下限**——13.0.2 的 ptxas 不认 `ptx.cuh` 里 `__CUDA_ARCH__ >= 1000` 分支的指令，且在第一次 dispatch 才炸，build 阶段看不出来，没有宏能绕。torch wheel 仍是 cu130（CUDA 次版本兼容，换 base 不用换 wheel）
 - **NCCL 2.31.2（pip 包，非 apt libnccl2）**：≥2.31 才有 GIN 设备 API（`nccl_device.h`）；基础镜像自带的 apt NCCL 2.28 无 GIN，构建时会删掉防止串版本
@@ -437,7 +437,7 @@ docker run --rm --gpus all --network host --ipc host --privileged   --ulimit mem
 
 **镜像是什么**。`docker/Dockerfile.pr1289` 在 `:official` 之上只重做 DeepEP 一层：卸掉原有的 deep_ep，把 PR #9 head（含 #8）与 PR #2 head（含 #1）做 git merge 后重编，工具链层与 `:official` 逐字节相同。merge 的 sha 由两个 PR head 加钉死的提交身份完全决定，各节点及 whn09 得到的都是同一个 BUILD_REF（附录 B 的 `PR1289_BUILD_REF`）；构建期自带 sha 校验与四条内容断言，能建出来就说明四个 PR 都在。细节见文件头注释。
 
-**构建**（每台节点，`:official` 建好之后；不依赖 `:pr12`；命中缓存约 5-10 分钟，日志存 `run/host/<role>-image-build-pr1289.txt`）：
+**构建**（每台节点，`:official` 建好之后；不依赖 `:pr12`；命中缓存约 2-5 分钟（32 vCPU 实测 1.5 分钟），日志存 `run/host/<role>-image-build-pr1289.txt`）：
 
 ```bash
 cd ~/deepep-image && docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
@@ -448,7 +448,7 @@ cd ~/deepep-image && docker build -f Dockerfile.pr1289 -t deepep-v2-efa:pr1289 .
 ```bash
 docker run --rm --entrypoint bash deepep-v2-efa:pr1289 -lc '
 cat /opt/DeepEP/BUILD_REF_PARENTS   # 两个 PR head：3c737dc...（#9 含 #8） bfbdd15...（#2 含 #1）
-cat /opt/DeepEP/BUILD_BASE          # deepep-v2-efa:official
+cat /opt/DeepEP/BUILD_BASE          # 本次构建实际传入的 BASE，默认 deepep-v2-efa:official
 PKG=$(python3 -c "import deep_ep,os;print(os.path.dirname(deep_ep.__file__))")
 strings $PKG/_C*.so | grep -c EP_NUM_SUB_PARTS                                            # PR1：>=1
 grep -c kMinTokensPerPart     $PKG/include/deep_ep/impls/hybrid_dispatch_unordered.cuh    # PR2：>=1
@@ -499,7 +499,7 @@ bash scripts/run_deepep_case.sh pr1289-decode-r2  pr1289 pr1289_sm12  128 8326
 执行方式：用本目录 `scripts/run_deepep_case.sh` 驱动，它把一个 case 的完整生命周期封装成一条命令——GPU 空闲预检、拒绝覆盖已有 tag、worker 先 leader 后地按 §0 远程长任务约定后台启动、短连接轮询、把日志收回 `run/logs/<tag>-<role>.log`：
 
 ```bash
-bash scripts/run_deepep_case.sh <tag> <official|pr12> <cache目录后缀> <tokens> <port> ["额外env"]
+bash scripts/run_deepep_case.sh <tag> <official|pr12|pr1289> <cache目录后缀> <tokens> <port> ["额外env"]
 ```
 
 脚本前置：`run/state.env` 里有节点 IP 和 KEY_PATH（第 2 部分完成后自然满足）；cache 目录不存在会自动创建。当前实现固定 2 节点（`--nnodes=2`，脚本内置 NODE_COUNT=2 守卫，非 2 直接报错退出）。4 节点扩展范围：三个 case 驱动的 launch/轮询/日志回收循环与 hostfile、`state.env` 的 `WORKER2_*/WORKER3_*` 键（附录 A），**以及 `parse_deepep.py` 的 `parse_tag()`——它当前只读 `<tag>-leader.log` 和 `<tag>-worker.log` 两个文件，4 节点不改会静默只聚合一半 rank（唯一线索是输出里 `ranks` 为 16 而非 32）**。完整 12 轮照抄即可（交错顺序、端口不重复）：
